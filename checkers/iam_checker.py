@@ -355,4 +355,95 @@ if __name__ == "__main__":
 
 # ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ
 
-#
+# 사용자(User)에게 직접 정책 연결
+
+import boto3
+from unittest.mock import MagicMock
+
+def check_direct_user_policies():
+    # 1. 실제 Boto3 IAM 클라이언트 생성 (테스트용 가짜 키 주입)
+    iam = boto3.client('iam', region_name='us-east-1', aws_access_key_id='mock', aws_secret_access_key='mock')
+
+    # ------------------------------------------------------------------
+    # [테스트 세팅] Boto3 메서드들이 가짜 데이터를 반환하도록 위장(Mock)합니다.
+    # 사용자는 2명(alice, bob)이 있다고 가정합니다.
+    iam.list_users = MagicMock(return_value={
+        'Users': [
+            {'UserName': 'alice_cloud'},
+            {'UserName': 'bob_infra'}
+        ]
+    })
+
+    # 사용자에 따라 각기 다른 '관리형 정책(Attached Policies)'을 반환하는 가짜 함수
+    def mock_list_attached_user_policies(UserName):
+        if UserName == 'alice_cloud':
+            # alice는 직접 연결된 관리형 정책이 1개 있음 (취약)
+            return {
+                'AttachedPolicies': [
+                    {'PolicyName': 'AdministratorAccess', 'PolicyArn': 'arn:aws:iam::aws:policy/AdministratorAccess'}
+                ]
+            }
+        else:
+            # bob은 관리형 정책이 직접 연결되어 있지 않음 (양호)
+            return {'AttachedPolicies': []}
+
+    # 사용자에 따라 각기 다른 '인라인 정책(Inline Policies)'을 반환하는 가짜 함수
+    def mock_list_user_policies(UserName):
+        if UserName == 'bob_infra':
+            # bob은 직접 작성된 인라인 정책이 1개 있음 (취약)
+            return {'PolicyNames': ['InlineS3AccessPolicy']}
+        else:
+            # alice는 인라인 정책이 없음 (양호)
+            return {'PolicyNames': []}
+
+    iam.list_attached_user_policies = MagicMock(side_effect=mock_list_attached_user_policies)
+    iam.list_user_policies = MagicMock(side_effect=mock_list_user_policies)
+    # ------------------------------------------------------------------
+
+    print("=== IAM 사용자 직접 정책 연결 취약점 점검을 시작합니다 ===\n")
+
+    # [Boto3 호출 1] 계정 내 전체 사용자 목록 가져오기
+    users = iam.list_users().get('Users', [])
+
+    if not users:
+        print("조회된 IAM 사용자가 없습니다.")
+        return
+
+    # 사용자별로 루프를 돌며 직접 붙은 정책이 있는지 체크
+    for user in users:
+        username = user['UserName']
+        print(f"👤 사용자 점검: [{username}]")
+        
+        # [Boto3 호출 2] 사용자에 직접 연결된 관리형 정책(Managed Policy) 목록 조회
+        attached_response = iam.list_attached_user_policies(UserName=username)
+        attached_policies = attached_response.get('AttachedPolicies', [])
+        
+        # [Boto3 호출 3] 사용자에 직접 내장된 인라인 정책(Inline Policy) 목록 조회
+        inline_response = iam.list_user_policies(UserName=username)
+        inline_policies = inline_response.get('PolicyNames', [])
+        
+        # 점검 결과 분석
+        has_direct_policy = False
+        
+        # 1. 관리형 정책 점검
+        if attached_policies:
+            has_direct_policy = True
+            print(f"  ❌ [취약] 관리형 정책이 직접 연결되어 있습니다.")
+            for policy in attached_policies:
+                print(f"    - 정책명: {policy['PolicyName']}")
+                
+        # 2. 인라인 정책 점검
+        if inline_policies:
+            has_direct_policy = True
+            print(f"  ❌ [취약] 인라인 정책이 직접 내장되어 있습니다.")
+            for policy_name in inline_policies:
+                print(f"    - 정책명: {policy_name}")
+                
+        # 3. 직접 연결된 정책이 하나도 없는 경우 (보안 모범 사례 준수)
+        if not has_direct_policy:
+            print("  ✅ [양호] 사용자에게 직접 연결된 정책이 없습니다. (그룹 권한 상속 권장)")
+        
+        print("-" * 50)
+
+if __name__ == "__main__":
+    check_direct_user_policies()
