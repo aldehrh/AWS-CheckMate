@@ -235,3 +235,124 @@ if __name__ == "__main__":
 
 # 와일드카드(*) 남용(과도한 권한 부여)
 
+import boto3
+import json
+from unittest.mock import MagicMock
+
+def check_wildcard_policies():
+    # 1. 실제 Boto3 IAM 클라이언트 생성 (테스트를 위해 가짜 키 주입)
+    iam = boto3.client('iam', region_name='us-east-1', aws_access_key_id='mock', aws_secret_access_key='mock')
+
+    # ------------------------------------------------------------------
+    # [테스트 세팅] Boto3 메서드들이 가짜 데이터를 반환하도록 위장(Mock)합니다.
+    
+    # 계정에 일반 사용자 1명(eve_developer)이 있다고 가정
+    iam.list_users = MagicMock(return_value={
+        'Users': [{'UserName': 'eve_developer'}]
+    })
+
+    # eve_developer에게 연결된 관리형 정책 목록 (위험한 정책 1개 연결됨)
+    iam.list_attached_user_policies = MagicMock(return_value={
+        'AttachedPolicies': [
+            {
+                'PolicyName': 'DangerousAdminPolicy',
+                'PolicyArn': 'arn:aws:iam::123456789012:policy/DangerousAdminPolicy'
+            }
+        ]
+    })
+
+    # 정책의 상세 정보 (현재 기본 버전 ID가 'v1'임을 명시)
+    iam.get_policy = MagicMock(return_value={
+        'Policy': {'DefaultVersionId': 'v1'}
+    })
+
+    # [핵심] 실제 정책의 JSON 내용 정의 (Action과 Resource에 와일드카드가 포함된 상태)
+    mock_policy_document = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": "*",           # ❌ 취약점 포인트 1
+                "Resource": "*"          # ❌ 취약점 포인트 2
+            },
+            {
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::my-bucket/*" # ⚠️ 특정 경로 와일드카드는 정상(여기선 단순 "*"만 체크)
+            }
+        ]
+    }
+
+    # get_policy_version 호출 시 위 JSON 문서를 반환하도록 설정
+    iam.get_policy_version = MagicMock(return_value={
+        'PolicyVersion': {
+            'Document': mock_policy_document
+        }
+    })
+    # ------------------------------------------------------------------
+
+    print("=== IAM 사용자 정책 와일드카드(*) 남용 점검을 시작합니다 ===\n")
+    
+    # [Boto3 호출 1] 전체 사용자 목록 가져오기
+    users = iam.list_users().get('Users', [])
+
+    for user in users:
+        username = user['UserName']
+        print(f"👤 사용자 점검: [{username}]")
+        
+        # [Boto3 호출 2] 사용자에게 직접 연결된 관리형 정책(Attached Policies) 가져오기
+        attached_policies = iam.list_attached_user_policies(UserName=username).get('AttachedPolicies', [])
+        
+        if not attached_policies:
+            print("  - 연결된 관리형 정책이 없습니다. [양호]")
+            continue
+
+        for policy in attached_policies:
+            policy_name = policy['PolicyName']
+            policy_arn = policy['PolicyArn']
+            
+            # [Boto3 호출 3] 정책의 기본 버전(DefaultVersionId) 확인
+            policy_info = iam.get_policy(PolicyArn=policy_arn)
+            default_version = policy_info['Policy']['DefaultVersionId']
+            
+            # [Boto3 호출 4] 정책의 실제 JSON 도큐먼트 내용 가져오기
+            version_info = iam.get_policy_version(PolicyArn=policy_arn, VersionId=default_version)
+            policy_doc = version_info['PolicyVersion']['Document']
+            
+            print(f"  📜 정책 확인 중: {policy_name}")
+            
+            # --- JSON 구조 분석 시작 ---
+            statements = policy_doc.get('Statement', [])
+            
+            # Statement가 단일 딕셔너리일 경우를 대비해 리스트로 통일
+            if isinstance(statements, dict):
+                statements = [statements]
+                
+            for idx, stmt in enumerate(statements):
+                # Effect가 'Allow'인 경우만 검사
+                if stmt.get('Effect') == 'Allow':
+                    action = stmt.get('Action')
+                    resource = stmt.get('Resource')
+                    
+                    # Action이나 Resource가 단일 별표 "*" 인지 체크
+                    # (리스트 형태 ["*"] 혹은 문자열 형태 "*" 둘 다 잡아내기 위함)
+                    has_wildcard_action = (action == '*') or (isinstance(action, list) and '*' in action)
+                    has_wildcard_resource = (resource == '*') or (isinstance(resource, list) and '*' in resource)
+                    
+                    if has_wildcard_action or has_wildcard_resource:
+                        print(f"    ❌ [취약 발견] Statement [{idx}]번 블록에서 과도한 권한이 감지되었습니다!")
+                        if has_wildcard_action:
+                            print(f"      - 위험 요소: 모든 액션 허용 (Action: '*')")
+                        if has_wildcard_resource:
+                            print(f"      - 위험 요소: 모든 자원 허용 (Resource: '*')")
+                    else:
+                        print(f"    ✅ Statement [{idx}]번 블록: 안전함")
+
+if __name__ == "__main__":
+    check_wildcard_policies()
+
+
+
+# ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ
+
+#
