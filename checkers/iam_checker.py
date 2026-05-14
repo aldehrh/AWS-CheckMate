@@ -84,3 +84,76 @@ if __name__ == "__main__":
 # ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ
 
 # 액세스 키의 코드 내 하드코딩
+import boto3
+from datetime import datetime, timezone
+from botocore.stub import Stubber  # Boto3 가상 응답 도구
+
+def check_access_keys(username):
+    # 1. 실제 Boto3 IAM 클라이언트 생성 (테스트를 위해 가짜 키 주입)
+    iam = boto3.client('iam', region_name='us-east-1', aws_access_key_id='mock', aws_secret_access_key='mock')
+
+    # ------------------------------------------------------------------
+    # [테스트용 가짜 데이터 설정] AWS 서버가 줄법한 실제 API 응답 구조입니다.
+    # 예시: 하나는 정상적이지만 오래된 키(Active), 하나는 비활성화된 키(Inactive)
+    mock_response = {
+        'AccessKeyMetadata': [
+            {
+                'UserName': username,
+                'AccessKeyId': 'AKIAIOSFODNN7EXAMPLE',
+                'Status': 'Active',
+                'CreateDate': datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc) # 생성된 지 오래된 키
+            },
+            {
+                'UserName': username,
+                'AccessKeyId': 'AKIAI44QH426EXAMPLE2',
+                'Status': 'Inactive',
+                'CreateDate': datetime(2026, 4, 15, 9, 30, 0, tzinfo=timezone.utc) # 비활성화된 키
+            }
+        ],
+        'IsTruncated': False
+    }
+
+    # Boto3 Stubber를 연결하여 list_access_keys 호출 시 위 데이터를 가로채서 반환하게 만듭니다.
+    stubber = Stubber(iam)
+    stubber.add_response('list_access_keys', mock_response, {'UserName': username})
+    stubber.activate()
+    # ------------------------------------------------------------------
+
+    print(f"=== 사용자 [{username}]의 액세스 키 점검을 시작합니다 ===")
+    
+    # [Boto3 실행] 특정 사용자의 액세스 키 목록 가져오기
+    response = iam.list_access_keys(UserName=username)
+    access_keys = response.get('AccessKeyMetadata', [])
+
+    if not access_keys:
+        print("결과: 생성된 액세스 키가 없습니다. [양호]")
+        return
+
+    now = datetime.now(timezone.utc)
+    
+    # 각 키의 정보(ID, 생성일, 상태) 확인 및 분석
+    for key in access_keys:
+        key_id = key['AccessKeyId']
+        status = key['Status']
+        create_date = key['CreateDate']
+        
+        # 키가 생성된 후 지난 일수 계산
+        days_since_creation = (now - create_date).days
+        
+        print(f"\n[키 ID]: {key_id}")
+        print(f"  - 상태(Status): {status}")
+        print(f"  - 생성일(CreateDate): {create_date.strftime('%Y-%m-%d')} (약 {days_since_creation}일 전 생성)")
+
+        # 취약점 진단 기준 (보안 모범 사례 적용)
+        # 1. 활성화(Active) 상태이면서 생성된 지 90일이 지난 경우 위험 (주기적 로테이션 미준수)
+        if status == 'Active' and days_since_creation > 90:
+            print(f"  ❌ 결과: [취약] 활성화된 키가 90일 이상 방치되었습니다. 키 교체(Rotation)가 필요합니다.")
+        # 2. 비활성화(Inactive) 상태인 경우
+        elif status == 'Inactive':
+            print(f"  ⚠️ 결과: [주의] 비활성화된 키입니다. 더 이상 쓰지 않는다면 안전을 위해 삭제를 권장합니다.")
+        else:
+            print(f"  ✅ 결과: [양호] 최근에 생성된 활성 키입니다.")
+
+if __name__ == "__main__":
+    # 테스트할 가상의 IAM 사용자 이름 입력
+    check_access_keys(username="test_developer")
